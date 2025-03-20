@@ -32,6 +32,26 @@ from f5_tts.api import F5TTS
 from f5_tts.model.utils import convert_char_to_pinyin
 from f5_tts.infer.utils_infer import transcribe
 
+import logging
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('f5_tts_training.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Log GPU information at startup
+logger.info("=== GPU Information ===")
+logger.info(f"CUDA available: {torch.cuda.is_available()}")
+logger.info(f"GPU count: {torch.cuda.device_count()}")
+if torch.cuda.is_available():
+    logger.info(f"GPU name: {torch.cuda.get_device_name(0)}")
+    logger.info(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
 
 training_process = None
 system = platform.system()
@@ -654,10 +674,20 @@ def create_data_project(name, tokenizer_type):
 
 
 def transcribe_all(name_project, audio_files, language, user=False, progress=gr.Progress()):
+    """Transcribe audio files using GPU acceleration."""
+    logger.info(f"Starting transcription for project: {name_project}")
+    
     path_project = os.path.join(path_data, name_project)
     path_dataset = os.path.join(path_project, "dataset")
     path_project_wavs = os.path.join(path_project, "wavs")
     file_metadata = os.path.join(path_project, "metadata.csv")
+
+    # Pre-load ASR model to GPU
+    from f5_tts.infer.utils_infer import _load_asr_model
+    model = _load_asr_model()
+    if torch.cuda.is_available():
+        model = model.cuda()
+        logger.info("ASR model moved to GPU")
 
     if not user:
         if audio_files is None:
@@ -689,39 +719,64 @@ def transcribe_all(name_project, audio_files, language, user=False, progress=gr.
     num = 0
     error_num = 0
     data = ""
-    for file_audio in progress.tqdm(file_audios, desc="transcribe files", total=len((file_audios))):
-        audio, _ = librosa.load(file_audio, sr=24000, mono=True)
+    
+    # Process audio files with GPU acceleration
+    for file_audio in progress.tqdm(file_audios, desc="transcribe files", total=len(file_audios)):
+        # Load audio to GPU
+        audio, sr = librosa.load(file_audio, sr=24000, mono=True)
+        audio = torch.FloatTensor(audio)
+        if torch.cuda.is_available():
+            audio = audio.cuda()
 
-        list_slicer = slicer.slice(audio)
+        # Process slices on GPU
+        list_slicer = slicer.slice(audio.cpu().numpy())  # Slicer expects numpy array
         for chunk, start, end in progress.tqdm(list_slicer, total=len(list_slicer), desc="slicer files"):
             name_segment = os.path.join(f"segment_{num}")
             file_segment = os.path.join(path_project_wavs, f"{name_segment}.wav")
 
-            tmp_max = np.abs(chunk).max()
+            # Process chunk on GPU
+            chunk = torch.FloatTensor(chunk)
+            if torch.cuda.is_available():
+                chunk = chunk.cuda()
+
+            tmp_max = torch.abs(chunk).max().item()
             if tmp_max > 1:
-                chunk /= tmp_max
+                chunk = chunk / tmp_max
             chunk = (chunk / tmp_max * (_max * alpha)) + (1 - alpha) * chunk
+            
+            # Save processed audio
+            chunk = chunk.cpu().numpy()
             wavfile.write(file_segment, 24000, (chunk * 32767).astype(np.int16))
 
             try:
-                text = transcribe(file_segment, language)
+                # Transcribe with GPU acceleration
+                with torch.cuda.amp.autocast():
+                    text = transcribe(file_segment, language, model=model)
                 text = text.lower().strip().replace('"', "")
 
                 data += f"{name_segment}|{text}\n"
-
                 num += 1
-            except:  # noqa: E722
+                
+                logger.info(f"Successfully transcribed segment {num}: {text}")
+            except Exception as e:
                 error_num += 1
+                logger.error(f"Error transcribing segment {num}: {str(e)}")
 
     with open(file_metadata, "w", encoding="utf-8-sig") as f:
         f.write(data)
 
-    if error_num != []:
-        error_text = f"\nerror files : {error_num}"
+    # Clear GPU cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.info("Cleared GPU cache")
+
+    if error_num != 0:
+        error_text = f"\nerror files: {error_num}"
     else:
         error_text = ""
 
-    return f"transcribe complete samples : {num}\npath : {path_project_wavs}{error_text}"
+    logger.info(f"Transcription completed. Processed {num} samples with {error_num} errors")
+    return f"transcribe complete samples: {num}\npath: {path_project_wavs}{error_text}"
 
 
 def format_seconds_to_hms(seconds):
@@ -1299,56 +1354,51 @@ def get_audio_project(project_name, is_gradio=True):
 
 
 def get_gpu_stats():
+    """Get detailed GPU statistics."""
     gpu_stats = ""
-
+    
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
         for i in range(gpu_count):
             gpu_name = torch.cuda.get_device_name(i)
             gpu_properties = torch.cuda.get_device_properties(i)
-            total_memory = gpu_properties.total_memory / (1024**3)  # in GB
-            allocated_memory = torch.cuda.memory_allocated(i) / (1024**2)  # in MB
-            reserved_memory = torch.cuda.memory_reserved(i) / (1024**2)  # in MB
-
-            gpu_stats += (
-                f"GPU {i} Name: {gpu_name}\n"
-                f"Total GPU memory (GPU {i}): {total_memory:.2f} GB\n"
-                f"Allocated GPU memory (GPU {i}): {allocated_memory:.2f} MB\n"
-                f"Reserved GPU memory (GPU {i}): {reserved_memory:.2f} MB\n\n"
-            )
-    elif torch.xpu.is_available():
-        gpu_count = torch.xpu.device_count()
-        for i in range(gpu_count):
-            gpu_name = torch.xpu.get_device_name(i)
-            gpu_properties = torch.xpu.get_device_properties(i)
-            total_memory = gpu_properties.total_memory / (1024**3)  # in GB
-            allocated_memory = torch.xpu.memory_allocated(i) / (1024**2)  # in MB
-            reserved_memory = torch.xpu.memory_reserved(i) / (1024**2)  # in MB
-
-            gpu_stats += (
-                f"GPU {i} Name: {gpu_name}\n"
-                f"Total GPU memory (GPU {i}): {total_memory:.2f} GB\n"
-                f"Allocated GPU memory (GPU {i}): {allocated_memory:.2f} MB\n"
-                f"Reserved GPU memory (GPU {i}): {reserved_memory:.2f} MB\n\n"
-            )
-    elif torch.backends.mps.is_available():
-        gpu_count = 1
-        gpu_stats += "MPS GPU\n"
-        total_memory = psutil.virtual_memory().total / (
-            1024**3
-        )  # Total system memory (MPS doesn't have its own memory)
-        allocated_memory = 0
-        reserved_memory = 0
-
-        gpu_stats += (
-            f"Total system memory: {total_memory:.2f} GB\n"
-            f"Allocated GPU memory (MPS): {allocated_memory:.2f} MB\n"
-            f"Reserved GPU memory (MPS): {reserved_memory:.2f} MB\n"
-        )
-
+            
+            # Get current GPU utilization using nvidia-smi
+            try:
+                result = subprocess.check_output(
+                    ['nvidia-smi', f'--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit', 
+                     '--format=csv,noheader,nounits']
+                ).decode().strip().split(',')
+                
+                gpu_util = f"{result[0].strip()}%"
+                mem_used = f"{result[1].strip()} MB"
+                mem_total = f"{result[2].strip()} MB"
+                temp = f"{result[3].strip()}°C"
+                power = f"{result[4].strip()}W / {result[5].strip()}W"
+                
+                gpu_stats += (
+                    f"GPU {i} Name: {gpu_name}\n"
+                    f"Utilization: {gpu_util}\n"
+                    f"Memory: {mem_used} / {mem_total}\n"
+                    f"Temperature: {temp}\n"
+                    f"Power: {power}\n"
+                    f"CUDA Capability: {gpu_properties.major}.{gpu_properties.minor}\n\n"
+                )
+            except:
+                # Fallback to basic PyTorch info if nvidia-smi fails
+                total_memory = gpu_properties.total_memory / (1024**2)
+                allocated_memory = torch.cuda.memory_allocated(i) / (1024**2)
+                reserved_memory = torch.cuda.memory_reserved(i) / (1024**2)
+                
+                gpu_stats += (
+                    f"GPU {i} Name: {gpu_name}\n"
+                    f"Total Memory: {total_memory:.0f} MB\n"
+                    f"Allocated Memory: {allocated_memory:.0f} MB\n"
+                    f"Reserved Memory: {reserved_memory:.0f} MB\n\n"
+                )
     else:
         gpu_stats = "No GPU available"
-
+    
     return gpu_stats
 
 

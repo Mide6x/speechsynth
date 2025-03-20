@@ -25,6 +25,7 @@ from huggingface_hub import snapshot_download, hf_hub_download
 from pydub import AudioSegment, silence
 from transformers import pipeline
 from vocos import Vocos
+import librosa
 
 from f5_tts.model import CFM
 from f5_tts.model.utils import (
@@ -165,17 +166,35 @@ def initialize_asr_pipeline(device: str = device, dtype=None):
 # transcribe
 
 
-def transcribe(ref_audio, language=None):
-    global asr_pipe
-    if asr_pipe is None:
-        initialize_asr_pipeline(device=device)
-    return asr_pipe(
-        ref_audio,
-        chunk_length_s=30,
-        batch_size=128,
-        generate_kwargs={"task": "transcribe", "language": language} if language else {"task": "transcribe"},
-        return_timestamps=False,
-    )["text"].strip()
+def transcribe(audio_path, language, model=None):
+    """Transcribe audio file using GPU acceleration."""
+    if model is None:
+        model = _load_asr_model()
+        if torch.cuda.is_available():
+            model = model.cuda()
+    
+    # Load and preprocess audio
+    audio, sr = librosa.load(audio_path, sr=16000)
+    audio = torch.FloatTensor(audio)
+    if torch.cuda.is_available():
+        audio = audio.cuda()
+    
+    # Transcribe with GPU acceleration
+    with torch.cuda.amp.autocast():
+        # Your existing transcription code here, but ensure data is on GPU
+        result = model.transcribe(audio)
+        text = result["text"]
+    
+    return text
+
+
+def _load_asr_model():
+    """Load ASR model with GPU support."""
+    import whisper
+    model = whisper.load_model("large-v3")
+    if torch.cuda.is_available():
+        model = model.cuda()
+    return model
 
 
 # load model checkpoint for inference

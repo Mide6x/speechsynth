@@ -41,6 +41,7 @@ dependencies = [
     "vocos",
     "wandb",
     "x_transformers>=1.31.14",
+    "openai-whisper>=20240930",
 ]
 
 [project.optional-dependencies]
